@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SDG&amp;E Energy Dashboard</title>
+<style>
+  :root {
+    --green: #059669;
+    --orange: #ff9944;
+    --red: #ff0000;
+    --bg: #f8fafc;
+    --card-bg: #fff;
+    --border: #e2e8f0;
+    --text: #1e293b;
+    --muted: #64748b;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }
+  header { text-align: center; padding: 2rem 1rem 1rem; }
+  header h1 { font-size: 1.5rem; }
+  header p { color: var(--muted); font-size: 0.9rem; margin-top: 0.25rem; }
+
+  #drop-zone {
+    max-width: 600px; margin: 1rem auto; padding: 3rem 2rem;
+    border: 2px dashed var(--border); border-radius: 12px;
+    text-align: center; cursor: pointer; transition: border-color 0.2s, background 0.2s;
+  }
+  #drop-zone.dragover { border-color: #3b82f6; background: #eff6ff; }
+  #drop-zone .icon { font-size: 2rem; margin-bottom: 0.5rem; }
+  #drop-zone .label { font-size: 1rem; color: var(--muted); }
+  #drop-zone .sublabel { font-size: 0.8rem; color: var(--muted); margin-top: 0.25rem; }
+  #file-info { text-align: center; color: var(--muted); font-size: 0.85rem; margin: 0.5rem 0 1rem; }
+
+  #summary-cards {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 1rem; max-width: 900px; margin: 0 auto 1.5rem; padding: 0 1rem;
+  }
+  .card {
+    background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px;
+    padding: 1rem 1.25rem; text-align: center;
+  }
+  .card .value { font-size: 1.6rem; font-weight: 700; }
+  .card .label { font-size: 0.8rem; color: var(--muted); margin-top: 0.15rem; }
+
+  #month-tabs {
+    display: flex; justify-content: center; gap: 0.5rem;
+    flex-wrap: wrap; margin: 0 1rem 1.5rem; padding: 0;
+  }
+  .tab-btn {
+    padding: 0.4rem 1rem; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--card-bg); cursor: pointer; font-size: 0.85rem; transition: all 0.15s;
+  }
+  .tab-btn:hover { border-color: #3b82f6; }
+  .tab-btn.active { background: #3b82f6; color: #fff; border-color: #3b82f6; }
+
+  #charts { max-width: 1100px; margin: 0 auto; padding: 0 1rem 3rem; }
+  .chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 1.5rem; }
+  .chart-box {
+    background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px;
+    padding: 1rem; position: relative;
+  }
+  .chart-box canvas { width: 100% !important; }
+  .chart-tall { min-height: 450px; }
+  .chart-full { grid-column: 1 / -1; }
+
+  @media (max-width: 700px) {
+    .chart-grid { grid-template-columns: 1fr; }
+    #summary-cards { grid-template-columns: repeat(2, 1fr); }
+  }
+  .hidden { display: none !important; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+</head>
+<body>
+<header>
+  <h1>SDG&amp;E EV-TOU-5 Energy Dashboard</h1>
+  <p>Drop an SDG&amp;E 15-minute interval CSV export to visualize usage and costs</p>
+</header>
+
+<div id="drop-zone">
+  <div class="icon">&#128193;</div>
+  <div class="label">Drag &amp; drop CSV here, or click to browse</div>
+  <div class="sublabel">SDG&amp;E Electric 15-Minute export (.csv)</div>
+  <input type="file" id="file-input" accept=".csv" style="display:none">
+</div>
+<div id="file-info"></div>
+
+<div id="summary-cards" class="hidden"></div>
+<div id="month-tabs" class="hidden"></div>
+<div id="charts" class="hidden">
+  <div class="chart-grid">
+    <div class="chart-box chart-tall"><canvas id="chart-hourly-kwh"></canvas></div>
+    <div class="chart-box chart-tall"><canvas id="chart-hourly-cost"></canvas></div>
+    <div class="chart-box"><canvas id="chart-tier-pie"></canvas></div>
+    <div class="chart-box chart-tall"><canvas id="chart-profile"></canvas></div>
+  </div>
+  <div class="chart-grid">
+    <div class="chart-box chart-full"><canvas id="chart-daily-cost"></canvas></div>
+  </div>
+</div>
+
+<script>
+// ── Rate schedule ──────────────────────────────────────────────
+const RATES = {
+  summer: { // May–Oct
+    weekday: [
+      [0,6,0.12,'super_off_peak'],
+      [6,16,0.50,'off_peak'],
+      [16,21,0.80,'on_peak'],
+      [21,24,0.50,'off_peak'],
+    ],
+    weekend: [
+      [0,14,0.12,'super_off_peak'],
+      [14,16,0.50,'off_peak'],
+      [16,21,0.80,'on_peak'],
+      [21,24,0.50,'off_peak'],
+    ]
+  },
+  winter: { // Nov–Feb
+    weekday: [
+      [0,6,0.12,'super_off_peak'],
+      [6,16,0.47,'off_peak'],
+      [16,21,0.53,'on_peak'],
+      [21,24,0.47,'off_peak'],
+    ],
+    weekend: [
+      [0,14,0.12,'super_off_peak'],
+      [14,16,0.47,'off_peak'],
+      [16,21,0.53,'on_peak'],
+      [21,24,0.47,'off_peak'],
+    ]
+  },
+  spring: { // Mar–Apr
+    weekday: [
+      [0,6,0.12,'super_off_peak'],
+      [6,10,0.47,'off_peak'],
+      [10,14,0.12,'super_off_peak'],
+      [14,16,0.47,'off_peak'],
+      [16,21,0.53,'on_peak'],
+      [21,24,0.47,'off_peak'],
+    ],
+    weekend: [
+      [0,14,0.12,'super_off_peak'],
+      [14,16,0.47,'off_peak'],
+      [16,21,0.53,'on_peak'],
+      [21,24,0.47,'off_peak'],
+    ]
+  }
+};
+
+const TIER_COLORS = { super_off_peak:'#059669', off_peak:'#ff9944', on_peak:'#ff0000' };
+const TIER_NAMES = { super_off_peak:'Super Off-Peak', off_peak:'Off-Peak', on_peak:'On-Peak' };
+const TIER_ORDER = ['super_off_peak','off_peak','on_peak'];
+
+function getSeason(month) {
+  if (month >= 5 && month <= 10) return 'summer';
+  if (month === 3 || month === 4) return 'spring';
+  return 'winter';
+}
+
+function getRateAndTier(hour, isWeekend, month) {
+  const season = getSeason(month);
+  const sched = isWeekend ? RATES[season].weekend : RATES[season].weekday;
+  for (const [s,e,rate,tier] of sched) {
+    if (hour >= s && hour < e) return { rate, tier };
+  }
+  return { rate: 0.47, tier: 'off_peak' };
+}
+
+function getRateScheduleForContext(rows) {
+  // Determine the dominant season for TOU band shading on the profile chart
+  if (!rows.length) return RATES.winter.weekday;
+  const months = {};
+  for (const r of rows) { months[r.month] = (months[r.month]||0)+1; }
+  let topMonth = rows[0].month;
+  let topCount = 0;
+  for (const [m,c] of Object.entries(months)) { if (c > topCount) { topCount = c; topMonth = +m; } }
+  const season = getSeason(topMonth);
+  return RATES[season].weekday;
+}
+
+// ── CSV Parsing ────────────────────────────────────────────────
+function parseCSV(text) {
+  const lines = text.split(/\r?\n/);
+  // Find the header row
+  let headerIdx = -1;
+  for (let i = 0; i < Math.min(lines.length, 20); i++) {
+    if (lines[i].replace(/"/g,'').startsWith('Meter Number,Date,Start Time')) {
+      headerIdx = i; break;
+    }
+  }
+  if (headerIdx < 0) throw new Error('Could not find CSV header row');
+
+  const rows = [];
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    // Parse quoted CSV
+    const cols = line.split(',').map(c => c.replace(/^"|"$/g,'').trim());
+    if (cols.length < 7) continue;
+    const [meter, dateStr, timeStr, dur, consStr, genStr, netStr] = cols;
+    const dt = parseDateTime(dateStr, timeStr);
+    if (!dt) continue;
+    const kwh = parseFloat(consStr) || 0;
+    const gen = parseFloat(genStr) || 0;
+    const net = parseFloat(netStr) || 0;
+    const isWeekend = dt.getDay() === 0 || dt.getDay() === 6;
+    const hour = dt.getHours();
+    const month = dt.getMonth() + 1;
+    const { rate, tier } = getRateAndTier(hour, isWeekend, month);
+    rows.push({ dt, hour, day: dt.getDay(), isWeekend, kwh, gen, net, rate, tier, cost: kwh * rate, month,
+      dateKey: `${dt.getFullYear()}-${String(month).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`,
+      monthKey: `${dt.getFullYear()}-${String(month).padStart(2,'0')}` });
+  }
+  return rows;
+}
+
+function parseDateTime(dateStr, timeStr) {
+  // dateStr: "M/D/YYYY", timeStr: "H:MM AM"
+  const dp = dateStr.split('/');
+  if (dp.length !== 3) return null;
+  const [m, d, y] = dp.map(Number);
+  const tp = timeStr.match(/^(\d+):(\d+)\s*(AM|PM)$/i);
+  if (!tp) return null;
+  let hr = parseInt(tp[1]);
+  const min = parseInt(tp[2]);
+  const ampm = tp[3].toUpperCase();
+  if (ampm === 'AM' && hr === 12) hr = 0;
+  else if (ampm === 'PM' && hr !== 12) hr += 12;
+  return new Date(y, m - 1, d, hr, min);
+}
+
+// ── Aggregation ────────────────────────────────────────────────
+function aggregateHourly(rows) {
+  const result = {};
+  for (const dayType of ['weekday','weekend']) {
+    const isWknd = dayType === 'weekend';
+    const filtered = rows.filter(r => r.isWeekend === isWknd);
+    const hours = []; const avgKwh = []; const avgCost = []; const tiers = [];
+    for (let h = 0; h < 24; h++) {
+      hours.push(h);
+      const hourRows = filtered.filter(r => r.hour === h);
+      // Group by date, sum per date, then average across dates
+      const byDate = {};
+      for (const r of hourRows) {
+        if (!byDate[r.dateKey]) byDate[r.dateKey] = { kwh: 0, cost: 0 };
+        byDate[r.dateKey].kwh += r.kwh;
+        byDate[r.dateKey].cost += r.cost;
+      }
+      const dates = Object.values(byDate);
+      const n = dates.length || 1;
+      avgKwh.push(dates.reduce((s,d) => s + d.kwh, 0) / n);
+      avgCost.push(dates.reduce((s,d) => s + d.cost, 0) / n);
+      // Use dominant month to pick tier
+      const domMonth = rows.length ? rows[Math.floor(rows.length/2)].month : 1;
+      tiers.push(getRateAndTier(h, isWknd, domMonth).tier);
+    }
+    result[dayType] = { hours, kwh: avgKwh, cost: avgCost, tiers };
+  }
+  return result;
+}
+
+function aggregateTierCosts(rows) {
+  const cost = {}, kwh = {};
+  for (const t of TIER_ORDER) { cost[t] = 0; kwh[t] = 0; }
+  for (const r of rows) { cost[r.tier] += r.cost; kwh[r.tier] += r.kwh; }
+  return { cost, kwh };
+}
+
+function aggregateDailyTierCosts(rows) {
+  const daily = {};
+  for (const r of rows) {
+    if (!daily[r.dateKey]) daily[r.dateKey] = { super_off_peak:0, off_peak:0, on_peak:0 };
+    daily[r.dateKey][r.tier] += r.cost;
+  }
+  return daily;
+}
+
+function splitByMonth(rows) {
+  const months = {};
+  for (const r of rows) {
+    if (!months[r.monthKey]) months[r.monthKey] = [];
+    months[r.monthKey].push(r);
+  }
+  return months;
+}
+
+// ── Chart rendering ────────────────────────────────────────────
+const chartInstances = {};
+
+function destroyCharts() {
+  for (const key of Object.keys(chartInstances)) {
+    chartInstances[key].destroy();
+    delete chartInstances[key];
+  }
+}
+
+const HOUR_LABELS = Array.from({length:24}, (_,h) => `${h%12||12}${h<12?'a':'p'}`);
+
+function renderCharts(rows) {
+  destroyCharts();
+  if (!rows.length) return;
+
+  const hourly = aggregateHourly(rows);
+  const { cost: tierCost, kwh: tierKwh } = aggregateTierCosts(rows);
+  const daily = aggregateDailyTierCosts(rows);
+
+  renderHourlyBar('chart-hourly-kwh', 'Average Hourly Consumption (kWh)', hourly, 'kwh', 'kWh');
+  renderHourlyBar('chart-hourly-cost', 'Average Hourly Cost ($)', hourly, 'cost', '$');
+  renderPie('chart-tier-pie', tierCost, tierKwh);
+  renderProfile('chart-profile', hourly, rows);
+  renderDailyStacked('chart-daily-cost', daily, rows);
+}
+
+function renderHourlyBar(canvasId, title, hourly, field, unit) {
+  const wd = hourly.weekday;
+  const we = hourly.weekend;
+  const ctx = document.getElementById(canvasId).getContext('2d');
+  chartInstances[canvasId] = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: HOUR_LABELS,
+      datasets: [
+        { label: 'Weekday', data: wd[field], backgroundColor: wd.tiers.map(t => TIER_COLORS[t]),
+          borderColor: '#fff', borderWidth: 0.5, barPercentage: 0.9, categoryPercentage: 0.8, order: 1 },
+        { label: 'Weekend', data: we[field], backgroundColor: we.tiers.map(t => TIER_COLORS[t] + '99'),
+          borderColor: '#fff', borderWidth: 0.5, barPercentage: 0.9, categoryPercentage: 0.8, order: 2 },
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        title: { display: true, text: title, font: { size: 14 } },
+        legend: {
+          labels: {
+            generateLabels: () => [
+              { text: 'Weekday', fillStyle: '#666', strokeStyle: '#666' },
+              { text: 'Weekend', fillStyle: '#66666699', strokeStyle: '#66666699' },
+              { text: 'Super Off-Peak', fillStyle: TIER_COLORS.super_off_peak },
+              { text: 'Off-Peak', fillStyle: TIER_COLORS.off_peak },
+              { text: 'On-Peak', fillStyle: TIER_COLORS.on_peak },
+            ]
+          }
+        },
+        tooltip: {
+          callbacks: {
+            label: ctx => {
+              const v = ctx.parsed.y;
+              return `${ctx.dataset.label}: ${unit === '$' ? '$'+v.toFixed(2) : v.toFixed(2)+' kWh'}`;
+            }
+          }
+        }
+      },
+      scales: {
+        y: { beginAtZero: true, title: { display: true, text: unit } },
+        x: { title: { display: true, text: 'Hour of Day' } }
+      }
+    }
+  });
+}
+
+// Inline plugin to draw labels on doughnut wedges (matches Python output)
+const doughnutLabelsPlugin = {
+  id: 'doughnutLabels',
+  afterDraw(chart) {
+    if (chart.config.type !== 'doughnut') return;
+    const meta = chart.getDatasetMeta(0);
+    if (!meta || !meta.data.length) return;
+    const ctx = chart.ctx;
+    const tierCost = chart._tierCost;
+    const tierKwh = chart._tierKwh;
+    const total = chart._tierTotal;
+    if (!tierCost) return;
+
+    meta.data.forEach((arc, i) => {
+      const t = TIER_ORDER[i];
+      const c = tierCost[t];
+      const k = tierKwh[t];
+      const pct = total > 0 ? (c / total * 100).toFixed(1) : '0.0';
+
+      const midAngle = (arc.startAngle + arc.endAngle) / 2;
+      const midRadius = (arc.innerRadius + arc.outerRadius) / 2;
+      const x = arc.x + Math.cos(midAngle) * midRadius;
+      const y = arc.y + Math.sin(midAngle) * midRadius;
+
+      ctx.save();
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = 'bold 13px -apple-system, sans-serif';
+      ctx.fillText(`$${c.toFixed(0)}`, x, y - 12);
+      ctx.font = '12px -apple-system, sans-serif';
+      ctx.fillText(`(${pct}%)`, x, y + 2);
+      ctx.fillText(`${k.toFixed(0)} kWh`, x, y + 16);
+      ctx.restore();
+    });
+  }
+};
+
+function renderPie(canvasId, tierCost, tierKwh) {
+  const total = TIER_ORDER.reduce((s,t) => s + tierCost[t], 0);
+  const ctx = document.getElementById(canvasId).getContext('2d');
+  const instance = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: TIER_ORDER.map(t => TIER_NAMES[t]),
+      datasets: [{
+        data: TIER_ORDER.map(t => tierCost[t]),
+        backgroundColor: TIER_ORDER.map(t => TIER_COLORS[t]),
+        borderWidth: 2, borderColor: '#fff'
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        title: { display: true, text: 'Cost Breakdown by TOU Period', font: { size: 14 } },
+        tooltip: {
+          callbacks: {
+            label: ctx => {
+              const t = TIER_ORDER[ctx.dataIndex];
+              const c = tierCost[t]; const k = tierKwh[t];
+              const pct = total > 0 ? (c/total*100).toFixed(1) : '0.0';
+              return `${TIER_NAMES[t]}: $${c.toFixed(2)} (${pct}%) — ${k.toFixed(0)} kWh`;
+            }
+          }
+        },
+        legend: { position: 'bottom' }
+      }
+    },
+    plugins: [doughnutLabelsPlugin]
+  });
+  // Attach data for the plugin to read
+  instance._tierCost = tierCost;
+  instance._tierKwh = tierKwh;
+  instance._tierTotal = total;
+  chartInstances[canvasId] = instance;
+}
+
+function renderProfile(canvasId, hourly, rows) {
+  const wd = hourly.weekday;
+  const we = hourly.weekend;
+  const sched = getRateScheduleForContext(rows);
+  // Build band datasets
+  const maxY = Math.max(...wd.kwh, ...we.kwh) * 1.15 || 1;
+  const bandDatasets = [];
+  for (const [s,e,,tier] of sched) {
+    const data = Array(24).fill(null);
+    for (let h = s; h < e; h++) data[h] = maxY;
+    bandDatasets.push({
+      label: TIER_NAMES[tier] + ' band',
+      data, type: 'bar', backgroundColor: TIER_COLORS[tier] + '20',
+      barPercentage: 1.0, categoryPercentage: 1.0, borderWidth: 0, order: 3,
+    });
+  }
+  const ctx = document.getElementById(canvasId).getContext('2d');
+  chartInstances[canvasId] = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: HOUR_LABELS,
+      datasets: [
+        ...bandDatasets,
+        { label: 'Weekday', data: wd.kwh, borderColor: '#2563eb', backgroundColor: '#2563eb',
+          pointRadius: 4, pointStyle: 'circle', tension: 0.1, order: 1 },
+        { label: 'Weekend', data: we.kwh, borderColor: '#9333ea', backgroundColor: '#9333ea',
+          pointRadius: 4, pointStyle: 'rectRot', borderDash: [5,3], tension: 0.1, order: 2 },
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        title: { display: true, text: 'Weekday vs Weekend Consumption Profile', font: { size: 14 } },
+        legend: {
+          labels: {
+            filter: item => !item.text.includes('band'),
+            generateLabels: (chart) => {
+              const orig = Chart.defaults.plugins.legend.labels.generateLabels(chart);
+              const filtered = orig.filter(l => !l.text.includes('band'));
+              // Add TOU band legend entries
+              for (const t of TIER_ORDER) {
+                filtered.push({ text: TIER_NAMES[t], fillStyle: TIER_COLORS[t] + '20',
+                  strokeStyle: TIER_COLORS[t], lineWidth: 1 });
+              }
+              return filtered;
+            }
+          }
+        },
+        tooltip: {
+          filter: item => !item.dataset.label.includes('band'),
+          callbacks: { label: ctx => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(2)} kWh` }
+        }
+      },
+      scales: {
+        y: { beginAtZero: true, max: maxY, title: { display: true, text: 'Avg kWh' } },
+        x: { title: { display: true, text: 'Hour of Day' } }
+      }
+    }
+  });
+}
+
+function renderDailyStacked(canvasId, daily, rows) {
+  const dates = Object.keys(daily).sort();
+  const labels = dates.map(d => {
+    const [y,m,dd] = d.split('-').map(Number);
+    return `${m}/${dd}`;
+  });
+  // Mark weekends
+  const bgColors = dates.map(d => {
+    const dt = new Date(d + 'T12:00:00');
+    return (dt.getDay() === 0 || dt.getDay() === 6) ? '#f1f5f9' : 'transparent';
+  });
+
+  const ctx = document.getElementById(canvasId).getContext('2d');
+  chartInstances[canvasId] = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: TIER_ORDER.map(t => ({
+        label: TIER_NAMES[t],
+        data: dates.map(d => daily[d][t]),
+        backgroundColor: TIER_COLORS[t],
+        borderWidth: 0
+      }))
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        title: { display: true, text: 'Daily Cost by TOU Period', font: { size: 14 } },
+        legend: { position: 'bottom' },
+        tooltip: {
+          callbacks: {
+            label: ctx => `${ctx.dataset.label}: $${ctx.parsed.y.toFixed(2)}`,
+            footer: items => {
+              const total = items.reduce((s,i) => s + i.parsed.y, 0);
+              return `Total: $${total.toFixed(2)}`;
+            }
+          }
+        }
+      },
+      scales: {
+        x: { stacked: true, title: { display: true, text: 'Date' },
+          ticks: { maxRotation: 45, font: { size: 10 } } },
+        y: { stacked: true, beginAtZero: true, title: { display: true, text: 'Cost ($)' } }
+      }
+    }
+  });
+}
+
+// ── Summary cards ──────────────────────────────────────────────
+function renderSummary(rows) {
+  const totalKwh = rows.reduce((s,r) => s + r.kwh, 0);
+  const totalCost = rows.reduce((s,r) => s + r.cost, 0);
+  const dates = new Set(rows.map(r => r.dateKey));
+  const days = dates.size || 1;
+  const avgPerDay = totalCost / days;
+
+  const el = document.getElementById('summary-cards');
+  el.innerHTML = `
+    <div class="card"><div class="value">${totalKwh.toFixed(0)}</div><div class="label">Total kWh</div></div>
+    <div class="card"><div class="value">$${totalCost.toFixed(2)}</div><div class="label">Total Cost</div></div>
+    <div class="card"><div class="value">$${avgPerDay.toFixed(2)}</div><div class="label">Avg $/Day</div></div>
+    <div class="card"><div class="value">${days}</div><div class="label">Days Analyzed</div></div>
+  `;
+  el.classList.remove('hidden');
+}
+
+// ── Month tabs ─────────────────────────────────────────────────
+let allRows = [];
+let monthMap = {};
+const MONTH_NAMES = ['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+function renderTabs() {
+  monthMap = splitByMonth(allRows);
+  const keys = Object.keys(monthMap).sort();
+  const tabsEl = document.getElementById('month-tabs');
+  tabsEl.innerHTML = '';
+
+  // All tab
+  const allBtn = document.createElement('button');
+  allBtn.className = 'tab-btn active';
+  allBtn.textContent = 'All';
+  allBtn.onclick = () => selectTab('all', allBtn);
+  tabsEl.appendChild(allBtn);
+
+  for (const key of keys) {
+    const [y, m] = key.split('-').map(Number);
+    const btn = document.createElement('button');
+    btn.className = 'tab-btn';
+    btn.textContent = `${MONTH_NAMES[m]} ${y}`;
+    btn.onclick = () => selectTab(key, btn);
+    tabsEl.appendChild(btn);
+  }
+  tabsEl.classList.remove('hidden');
+}
+
+function selectTab(key, btn) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  const rows = key === 'all' ? allRows : monthMap[key];
+  renderSummary(rows);
+  renderCharts(rows);
+}
+
+// ── File handling ──────────────────────────────────────────────
+function handleFile(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      allRows = parseCSV(e.target.result);
+      if (!allRows.length) { alert('No data rows found in CSV.'); return; }
+      const dates = allRows.map(r => r.dt);
+      const minDate = new Date(Math.min(...dates));
+      const maxDate = new Date(Math.max(...dates));
+      document.getElementById('file-info').textContent =
+        `${file.name} — ${minDate.toLocaleDateString()} to ${maxDate.toLocaleDateString()} (${allRows.length} intervals)`;
+      renderSummary(allRows);
+      renderTabs();
+      document.getElementById('charts').classList.remove('hidden');
+      renderCharts(allRows);
+    } catch (err) {
+      alert('Error parsing CSV: ' + err.message);
+      console.error(err);
+    }
+  };
+  reader.readAsText(file);
+}
+
+// ── Drop zone wiring ──────────────────────────────────────────
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+
+dropZone.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', e => { if (e.target.files[0]) handleFile(e.target.files[0]); });
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault(); dropZone.classList.remove('dragover');
+  if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+});
+</script>
+</body>
+</html>
