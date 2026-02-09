@@ -68,9 +68,27 @@
     .chart-grid { grid-template-columns: 1fr; }
     #summary-cards { grid-template-columns: repeat(2, 1fr); }
   }
+  #download-bar {
+    display: flex; justify-content: center; align-items: center; gap: 0.5rem;
+    margin: 0 1rem 1.5rem;
+  }
+  #download-bar select {
+    padding: 0.4rem 0.6rem; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--card-bg); font-size: 0.85rem; cursor: pointer;
+  }
+  #download-bar button {
+    padding: 0.4rem 1.2rem; border: 1px solid #3b82f6; border-radius: 6px;
+    background: #3b82f6; color: #fff; font-size: 0.85rem; cursor: pointer;
+    transition: background 0.15s;
+  }
+  #download-bar button:hover { background: #2563eb; }
+  #download-bar button:disabled { opacity: 0.5; cursor: not-allowed; }
   .hidden { display: none !important; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf@2/dist/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3/dist/jszip.min.js"></script>
 </head>
 <body>
 <header>
@@ -88,6 +106,14 @@
 
 <div id="summary-cards" class="hidden"></div>
 <div id="month-tabs" class="hidden"></div>
+<div id="download-bar" class="hidden">
+  <select id="download-format">
+    <option value="png">PNG image</option>
+    <option value="png-zip">PNG images (ZIP)</option>
+    <option value="pdf">PDF (one page per month)</option>
+  </select>
+  <button id="download-btn" onclick="doDownload()">Download</button>
+</div>
 <div id="charts" class="hidden">
   <div class="chart-grid">
     <div class="chart-box chart-tall"><canvas id="chart-hourly-kwh"></canvas></div>
@@ -331,6 +357,7 @@ function renderHourlyBar(canvasId, title, hourly, field, unit) {
     options: {
       responsive: true,
       maintainAspectRatio: false,
+      animation: false,
       plugins: {
         title: { display: true, text: title, font: { size: 14 } },
         legend: {
@@ -414,6 +441,7 @@ function renderPie(canvasId, tierCost, tierKwh) {
     },
     options: {
       responsive: true,
+      animation: false,
       plugins: {
         title: { display: true, text: 'Cost Breakdown by TOU Period', font: { size: 14 } },
         tooltip: {
@@ -431,10 +459,11 @@ function renderPie(canvasId, tierCost, tierKwh) {
     },
     plugins: [doughnutLabelsPlugin]
   });
-  // Attach data for the plugin to read
+  // Attach data for the plugin to read, then re-render to draw labels
   instance._tierCost = tierCost;
   instance._tierKwh = tierKwh;
   instance._tierTotal = total;
+  instance.update();
   chartInstances[canvasId] = instance;
 }
 
@@ -470,6 +499,7 @@ function renderProfile(canvasId, hourly, rows) {
     options: {
       responsive: true,
       maintainAspectRatio: false,
+      animation: false,
       plugins: {
         title: { display: true, text: 'Weekday vs Weekend Consumption Profile', font: { size: 14 } },
         legend: {
@@ -526,6 +556,7 @@ function renderDailyStacked(canvasId, daily, rows) {
     },
     options: {
       responsive: true,
+      animation: false,
       plugins: {
         title: { display: true, text: 'Daily Cost by TOU Period', font: { size: 14 } },
         legend: { position: 'bottom' },
@@ -618,6 +649,7 @@ function handleFile(file) {
         `${file.name} — ${minDate.toLocaleDateString()} to ${maxDate.toLocaleDateString()} (${allRows.length} intervals)`;
       renderSummary(allRows);
       renderTabs();
+      document.getElementById('download-bar').classList.remove('hidden');
       document.getElementById('charts').classList.remove('hidden');
       renderCharts(allRows);
     } catch (err) {
@@ -641,6 +673,265 @@ dropZone.addEventListener('drop', e => {
   e.preventDefault(); dropZone.classList.remove('dragover');
   if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
 });
+
+// ── Download / Export ──────────────────────────────────────────
+const MONTH_FULL = ['','January','February','March','April','May','June',
+  'July','August','September','October','November','December'];
+const CHART_IDS = ['chart-hourly-kwh','chart-hourly-cost','chart-tier-pie','chart-profile','chart-daily-cost'];
+// Use same DPI for both PNG and PDF to ensure identical rendering
+const EXPORT_DPI = 300;
+
+function waitForCharts() {
+  // Chart.js uses rAF internally; wait for two full frames plus a short delay
+  return new Promise(r => setTimeout(() => requestAnimationFrame(() => requestAnimationFrame(r)), 100));
+}
+
+function getSummaryText(rows) {
+  const totalKwh = rows.reduce((s,r) => s + r.kwh, 0);
+  const totalCost = rows.reduce((s,r) => s + r.cost, 0);
+  const days = new Set(rows.map(r => r.dateKey)).size || 1;
+  const avgPerDay = totalCost / days;
+  return `Total: ${totalKwh.toFixed(0)} kWh  |  Cost: $${totalCost.toFixed(2)}  |  Avg: $${avgPerDay.toFixed(2)}/day  |  ${days} days`;
+}
+
+function getChartImages() {
+  // Get PNG data URLs from all live Chart.js instances
+  const images = [];
+  for (const id of CHART_IDS) {
+    const inst = chartInstances[id];
+    if (inst) {
+      const canvas = inst.canvas;
+      images.push({ id, dataUrl: canvas.toDataURL('image/png'), w: canvas.width, h: canvas.height });
+    }
+  }
+  return images;
+}
+
+function compositeToCanvas(images, titleText, summaryText) {
+  // Layout: title, summary, then 2x2 grid of first 4 charts, then full-width daily chart
+  const pad = 30;
+  const gap = 20;
+  const totalW = 2200;
+  const colW = (totalW - pad * 2 - gap) / 2;
+
+  // Compute row heights from actual chart aspect ratios
+  const scaled = images.map(img => {
+    const w = img.id === 'chart-daily-cost' ? totalW - pad * 2 : colW;
+    const h = (img.h / img.w) * w;
+    return { ...img, drawW: w, drawH: h };
+  });
+
+  const topCharts = scaled.filter(s => s.id !== 'chart-daily-cost');
+  const bottomChart = scaled.find(s => s.id === 'chart-daily-cost');
+
+  const row1H = Math.max(topCharts[0]?.drawH || 0, topCharts[1]?.drawH || 0);
+  const row2H = Math.max(topCharts[2]?.drawH || 0, topCharts[3]?.drawH || 0);
+  const bottomH = bottomChart ? bottomChart.drawH : 0;
+
+  const headerH = 90;
+  const totalH = headerH + row1H + gap + row2H + gap + bottomH + pad * 2;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = totalW;
+  canvas.height = totalH;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#f8fafc';
+  ctx.fillRect(0, 0, totalW, totalH);
+
+  // Title
+  ctx.fillStyle = '#1e293b';
+  ctx.font = 'bold 36px -apple-system, BlinkMacSystemFont, sans-serif';
+  ctx.fillText(titleText, pad, pad + 36);
+  // Summary line
+  ctx.font = '24px -apple-system, BlinkMacSystemFont, sans-serif';
+  ctx.fillStyle = '#64748b';
+  ctx.fillText(summaryText, pad, pad + 70);
+
+  let y = pad + headerH;
+
+  // Draw chart images
+  return new Promise(resolve => {
+    let loaded = 0;
+    const imgEls = [];
+    for (const s of scaled) {
+      const imgEl = new Image();
+      imgEl.onload = () => { loaded++; if (loaded === scaled.length) drawAll(); };
+      imgEl.src = s.dataUrl;
+      imgEls.push({ el: imgEl, meta: s });
+    }
+
+    function drawAll() {
+      // Row 1: charts 0,1
+      const positions = [
+        { x: pad, y: y },
+        { x: pad + colW + gap, y: y },
+        { x: pad, y: y + row1H + gap },
+        { x: pad + colW + gap, y: y + row1H + gap },
+      ];
+      for (let i = 0; i < topCharts.length; i++) {
+        const entry = imgEls.find(e => e.meta.id === topCharts[i].id);
+        if (entry) ctx.drawImage(entry.el, positions[i].x, positions[i].y, entry.meta.drawW, entry.meta.drawH);
+      }
+      // Bottom chart
+      if (bottomChart) {
+        const entry = imgEls.find(e => e.meta.id === 'chart-daily-cost');
+        if (entry) ctx.drawImage(entry.el, pad, y + row1H + gap + row2H + gap, entry.meta.drawW, entry.meta.drawH);
+      }
+      resolve(canvas);
+    }
+  });
+}
+
+async function downloadPNG() {
+  const btn = document.getElementById('download-btn');
+  btn.disabled = true; btn.textContent = 'Capturing...';
+  try {
+    await waitForCharts();
+    const images = getChartImages();
+    const activeTab = document.querySelector('.tab-btn.active')?.textContent;
+
+    // Determine rows, title, and filename based on selected tab
+    let rows = allRows;
+    let title = 'SDG&E EV-TOU-5 Energy Dashboard';
+    let filename = 'sdge-dashboard.png';
+
+    if (activeTab !== 'All') {
+      const key = Object.keys(monthMap).sort().find(k => {
+        const [y, m] = k.split('-').map(Number);
+        return activeTab === `${MONTH_NAMES[m]} ${y}`;
+      });
+      if (key) {
+        const [y, m] = key.split('-').map(Number);
+        rows = monthMap[key];
+        title = `SDG&E EV-TOU-5 — ${MONTH_FULL[m]} ${y}`;
+        filename = `sdge-dashboard-${y}-${String(m).padStart(2, '0')}.png`;
+      }
+    }
+
+    const canvas = await compositeToCanvas(images, title, getSummaryText(rows));
+    const a = document.createElement('a');
+    a.download = filename;
+    a.href = canvas.toDataURL('image/png');
+    a.click();
+  } finally {
+    btn.disabled = false; btn.textContent = 'Download';
+  }
+}
+
+async function downloadPDF() {
+  const btn = document.getElementById('download-btn');
+  btn.disabled = true; btn.textContent = 'Generating PDF...';
+  try {
+    const { jsPDF } = window.jspdf;
+
+    const keys = Object.keys(monthMap).sort();
+    const tabBtns = document.querySelectorAll('.tab-btn');
+
+    // Generate PNG for each month using the same logic as downloadPNG
+    const pages = [];
+    for (const key of keys) {
+      const [y, m] = key.split('-').map(Number);
+      const tabLabel = `${MONTH_NAMES[m]} ${y}`;
+
+      // Click the month tab (same as user would)
+      const tabBtn = Array.from(tabBtns).find(b => b.textContent === tabLabel);
+      if (tabBtn) selectTab(key, tabBtn);
+
+      // Use same capture logic as downloadPNG
+      await waitForCharts();
+      const images = getChartImages();
+      const title = `SDG&E EV-TOU-5 — ${MONTH_FULL[m]} ${y}`;
+      const summary = getSummaryText(monthMap[key]);
+      const canvas = await compositeToCanvas(images, title, summary);
+
+      pages.push({
+        imgData: canvas.toDataURL('image/png'),
+        width: canvas.width,
+        height: canvas.height
+      });
+    }
+
+    // Restore "All" view
+    const allBtn = document.querySelector('.tab-btn');
+    if (allBtn) selectTab('all', allBtn);
+
+    // Build PDF from PNG images
+    const pxToMm = 25.4 / EXPORT_DPI;
+    const firstPage = pages[0];
+    const pdf = new jsPDF({
+      orientation: firstPage.width > firstPage.height ? 'landscape' : 'portrait',
+      unit: 'mm',
+      format: [firstPage.width * pxToMm, firstPage.height * pxToMm]
+    });
+
+    for (let i = 0; i < pages.length; i++) {
+      const page = pages[i];
+      const w = page.width * pxToMm;
+      const h = page.height * pxToMm;
+
+      if (i > 0) {
+        pdf.addPage([w, h], w > h ? 'landscape' : 'portrait');
+      }
+
+      pdf.addImage(page.imgData, 'PNG', 0, 0, w, h);
+    }
+
+    pdf.save('sdge-dashboard.pdf');
+  } catch (err) {
+    console.error('PDF generation failed:', err);
+    alert('PDF generation failed: ' + err.message);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Download';
+  }
+}
+
+async function downloadPNGZip() {
+  const btn = document.getElementById('download-btn');
+  btn.disabled = true; btn.textContent = 'Generating ZIP...';
+  try {
+    const zip = new JSZip();
+    const keys = Object.keys(monthMap).sort();
+    const tabBtns = document.querySelectorAll('.tab-btn');
+
+    for (const key of keys) {
+      const [y, m] = key.split('-').map(Number);
+      const tabLabel = `${MONTH_NAMES[m]} ${y}`;
+      const tabBtn = Array.from(tabBtns).find(b => b.textContent === tabLabel);
+      if (tabBtn) selectTab(key, tabBtn);
+
+      await waitForCharts();
+      const images = getChartImages();
+      const title = `SDG&E EV-TOU-5 — ${MONTH_FULL[m]} ${y}`;
+      const canvas = await compositeToCanvas(images, title, getSummaryText(monthMap[key]));
+
+      // Convert canvas to blob and add to ZIP
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+      zip.file(`sdge-dashboard-${y}-${String(m).padStart(2, '0')}.png`, blob);
+    }
+
+    // Restore "All" view
+    const allBtn = document.querySelector('.tab-btn');
+    if (allBtn) selectTab('all', allBtn);
+
+    // Generate and download ZIP
+    const content = await zip.generateAsync({ type: 'blob' });
+    const a = document.createElement('a');
+    a.download = 'sdge-dashboard-images.zip';
+    a.href = URL.createObjectURL(content);
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Download';
+  }
+}
+
+function doDownload() {
+  if (!allRows.length) return;
+  const fmt = document.getElementById('download-format').value;
+  if (fmt === 'pdf') downloadPDF();
+  else if (fmt === 'png-zip') downloadPNGZip();
+  else downloadPNG();
+}
 </script>
 </body>
 </html>
